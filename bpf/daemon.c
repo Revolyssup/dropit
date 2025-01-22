@@ -231,64 +231,66 @@ static u64 filter_packet(struct bpf_map *map, u32 *key,
 
 
 SEC("tc")
-int intercept_packets_tc_egress(struct __sk_buff *ctx){
-  //Parse skbuff to create the packet struct and pass that to filter_packets
-  struct packet pk;
-  pk.direction = Egress;
-  // We mark the start and end of our ethernet frame
-  void *ethernet_start = (void *)(long)ctx->data;
-  void *ethernet_end = (void *)(long)ctx->data_end;
+int intercept_packets_tc_egress(struct __sk_buff *ctx) {
+    struct packet pk = {};
+    pk.direction = Egress;
 
-  struct ethhdr *ethernet_frame = ethernet_start;
-  // Check if we have the entire ethernet frame
-  if ((void *)ethernet_frame + sizeof(*ethernet_frame) <= ethernet_end) {
-    struct iphdr *ip_packet = ethernet_start + sizeof(*ethernet_frame);
-
-    // Check if the IP packet is within the bounds of ethernet frame
-    if ((void *)ip_packet + sizeof(*ip_packet) <= ethernet_end) {
-          // extract info from the IP packet
-      struct packet pk;
-      pk.source_ip = ip_packet->saddr;
-      pk.dest_ip = ip_packet->daddr;
-      pk.protocol = ip_packet->protocol;
-      pk.size = (ethernet_end - ethernet_start);
-      pk.dest_port = pk.source_port = 0;
-      pk.is_dropped = 0;
+    // Extract IP header (aligned access)
+    __u8 ip_header[20] __attribute__((aligned(4))); // Ensure alignment
+    if (bpf_skb_load_bytes(ctx, ETH_HLEN, ip_header, sizeof(ip_header)) < 0) {
+        return TC_ACT_OK;
     }
-          // check the protocol and get port
-      if (pk.protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (void *)ip_packet + sizeof(*ip_packet);
-        if ((void *)tcp + sizeof(*tcp) <= ethernet_end) {
-          // Checking if the destination port matches with the specified port
-          pk.source_port = tcp->source;
-          pk.dest_port = tcp->dest;
-        }
-      }
 
-      if (pk.protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (void *)ip_packet + sizeof(*ip_packet);
-        if ((void *)udp + sizeof(*udp) <= ethernet_end) {
-          // Checking if the destination port matches with the specified port
-          pk.source_port = udp->source;
-          pk.dest_port = udp->dest;
+    // Safely extract IP addresses
+    __u32 src_ip, dst_ip;
+    __builtin_memcpy(&src_ip, &ip_header[12], sizeof(src_ip)); // Offset 12 for source IP
+    __builtin_memcpy(&dst_ip, &ip_header[16], sizeof(dst_ip)); // Offset 16 for dest IP
+    pk.source_ip = bpf_ntohl(src_ip);
+    pk.dest_ip = bpf_ntohl(dst_ip);
+
+    // Extract protocol
+    pk.protocol = ip_header[9]; // Protocol field in IPv4 header (Offset 9)
+
+    // Extract ports if protocol is TCP/UDP
+    if (pk.protocol == IPPROTO_TCP || pk.protocol == IPPROTO_UDP) {
+        __u8 port_header[4] __attribute__((aligned(4))); // 4 bytes for source and dest ports
+        if (bpf_skb_load_bytes(ctx, ETH_HLEN + sizeof(ip_header), port_header, sizeof(port_header)) < 0) {
+            return TC_ACT_OK;
         }
-      }
-      struct lookup_ctx data = {
-          .pk = &pk,
-          .tc_output = 0,
-      };
-      bpf_for_each_map_elem(&filter_rules, filter_packet, &data, 0);
-      if(data.tc_output == TC_ACT_SHOT){
+
+        // Safely extract ports
+        __u16 src_port, dst_port;
+        __builtin_memcpy(&src_port, &port_header[0], sizeof(src_port)); // Source port
+        __builtin_memcpy(&dst_port, &port_header[2], sizeof(dst_port)); // Dest port
+        pk.source_port = bpf_ntohs(src_port);
+        pk.dest_port = bpf_ntohs(dst_port);
+    } else {
+        pk.source_port = pk.dest_port = 0;
+    }
+
+    pk.size = ctx->len;
+    pk.is_dropped = 0;
+
+    // Context for packet filtering
+    struct lookup_ctx data = {
+        .pk = &pk,
+        .tc_output = 0,
+    };
+
+    // Apply filtering logic
+    bpf_for_each_map_elem(&filter_rules, filter_packet, &data, 0);
+
+    // Drop or allow packet
+    if (data.tc_output == TC_ACT_SHOT) {
         pk.is_dropped = 1;
         push_log(&pk);
         return TC_ACT_SHOT;
-      }
-      push_log(&pk);
-      return TC_ACT_OK;
-  }
-  push_log(&pk);
-  return TC_ACT_SHOT;
+    }
+
+    push_log(&pk);
+    return TC_ACT_OK;
 }
+
 
 
 SEC("xdp")
